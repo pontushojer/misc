@@ -9,6 +9,7 @@ import pandas as pd
 import sys
 import random
 import collections
+import itertools
 import numpy as np
 import logging
 import time
@@ -49,6 +50,17 @@ def translate(base):
     return translate_dict[base.upper()]
 
 
+def get_list_chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
+def get_dict_chunks(data, n=1):
+    c = None
+    it = iter(data)
+    for i in range(0, n):
+        yield {k:data[k] for k in itertools.islice(it, int(math.ceil(length/n)))}
+
 def get_arguments():
     parser = argparse.ArgumentParser()
 
@@ -82,16 +94,8 @@ def create_barcode(sequence_options):
     return generated_barcode
 
 
-def create_barcodes(n, barcode_options, no_prog=False):
-    barcodes = list()
-    for i in tqdm(range(n), total = n, desc="Create BCs", unit= "bc", leave=False, disable=no_prog):
-        counter['Barcodes start'] += 1
-        barcodes.append(create_barcode(barcode_options))
-    return barcodes
-
-
 def create_barcodes_generator(n, barcode_options, no_prog=False):
-    for i in tqdm(range(n), total = n, desc="Create BCs", unit= "bc", leave=False, disable=no_prog):
+    for i in range(n):
         counter['Barcodes start'] += 1
         yield create_barcode(barcode_options)
 
@@ -100,68 +104,75 @@ def amplify(barcode, efficiency=1, error_rate=0.00001):
     """
     simulate amplification on a single barcode efficiency
     """
-    assert 0 < efficiency <= 1, "PCR efficiency must be between 0 and 1"
-    logger.debug(f"Barcode amplification: {barcode}")
+    def add_base(base, error_rate=0.00001):
+        if np.random.random() <= error_rate:
+            counter['pcr errors'] += 1
+            return np.random.choice(errors_dict[base])
+        else:
+            return base
 
-    if efficiency == 1:
-        logger.debug(f"Amplified.")
+    def get_product(barcode, error_rate=0.00001):
         if error_rate == 0:
             return barcode, barcode
         else:
-            new_barcode = str()
-            for base in barcode:
-                if np.random.random() <= error_rate:
-                    new_barcode += np.random.choice(errors_dict[base])
-                else:
-                    new_barcode += base
+            new_barcode = ''.join(add_base(base, error_rate=error_rate) for base in barcode)
             return barcode, new_barcode
+
+    assert 0 < efficiency <= 1, "PCR efficiency must be between 0 and 1"
+
+    logger.debug(f"Barcode amplification: {barcode}")
+
+    if efficiency == 1:
+        return get_product(barcode, error_rate=error_rate)
+    elif np.random.random() > (1 - efficiency):
+        return get_product(barcode, error_rate=error_rate)
     else:
-        if np.random.random() > (1 - efficiency):
-            logger.debug(f"Amplified.")
-            if error_rate == 0:
-                return barcode, barcode
-            else:
-                new_barcode = str()
-                for base in barcode:
-                    if np.random.random() <= error_rate:
-                        new_barcode += np.random.choice(errors_dict[base])
-                    else:
-                        new_barcode += base
-                return barcode, new_barcode
-        else:
-            logger.debug(f"Not amplified.")
-            return barcode,
+        return barcode,
 
 
-def simulate_pcr_cycle(barcodes, efficiency=1, error_rate=0.00001):
-    new_list = []
-    for barcode in tqdm(barcodes, desc="Amplifing BCs",unit= "bc", leave=False):
-        new_list.extend(amplify(barcode, efficiency=efficiency, error_rate=error_rate))
-    return new_list
+def simulate_pcr_cycle(barcodes, efficiency=1, error_rate=0.00001, no_prog=True):
+    amplicons = []
+    for barcode in tqdm(barcodes, desc="Amplifying", unit="bc", disable=no_prog, leave=False):
+        amplicons.extend(amplify(barcode, efficiency=efficiency, error_rate=error_rate))
+    return amplicons
 
 
-def pcr_cycles(barcodes, efficiency=1, pcr_cycles=0, error_rate=0.00001):
+def pcr_func(args):
+    return simulate_pcr_cycle(*args)
+
+
+def pcr_cycles(barcodes, efficiency=1, pcr_cycles=0, error_rate=0.00001, nprocs=1):
     if pcr_cycles == 0:
         logger.debug(f"No PCR")
         return collections.Counter(barcodes)
 
     for cycle in tqdm(range(0, pcr_cycles), desc="Running PCR", unit="cycles", leave=False):
         logger.debug(f"PCR cycle {cycle}")
-        post_cycle = simulate_pcr_cycle(barcodes, efficiency=efficiency, error_rate=error_rate)
+        if nprocs == 1:
+            post_cycle = simulate_pcr_cycle(barcodes, efficiency=efficiency, error_rate=error_rate, no_prog=False)
+        else:
+            chunks = get_list_chunks(barcodes, nprocs)
+            tasks = [(chunk, efficiency, error_rate) for chunk in chunks]
+            post_cycle = []
+            with multiprocessing.Pool(nprocs) as pool:
+                result = tqdm(pool.imap_unordered(pcr_func, tasks), total=len(barcodes), desc="Amplifying", unit="bc", leave=False)
+                for r in result:
+                    post_cycle.extend(r)
 
         barcodes = post_cycle
+
     return collections.Counter(barcodes)
 
 
-def add_sequencing_errors(barcode_counter, seq_error_rate=0.01):
+def add_sequencing_errors(barcode_counts, seq_error_rate=0.01):
     """
     Takes a barcode counter object and adds errors at random to simulate sequencing errors
-    :param barcode_counter:
+    :param barcode_counts:
     :param seq_error_rate:
     :return:
     """
     new_list = []
-    for barcode in tqdm(barcode_counter.elements(), total=sum(barcode_counter.values()), desc="Sequencing BCs",unit= "bc", leave=False):
+    for barcode in tqdm(barcode_counts.elements(), total=sum(barcode_counts.values()), desc="Sequencing BCs", unit="bc", leave=False):
         new_barcode = str()
         for base in barcode:
             if np.random.random() > seq_error_rate:
@@ -173,23 +184,6 @@ def add_sequencing_errors(barcode_counter, seq_error_rate=0.01):
         new_list.append(new_barcode)
     return collections.Counter(new_list)
 
-
-def func(args):
-    return create_barcodes(*args)
-
-def process_create(nprocs, number, barcode_options):
-
-    chunks = [int(math.ceil(number / nprocs)) for i in range(nprocs - 1)]
-    chunks = chunks + [number - sum(chunks)]
-
-    tasks = [(chunk, barcode_options, True) for chunk in chunks]
-    output = []
-    with multiprocessing.Pool(nprocs) as pool:
-        result = pool.imap_unordered(func, tasks)
-        for r in result:
-            output.extend(r)
-
-    return output
 
 def main():
     args = get_arguments()
@@ -221,44 +215,37 @@ def main():
     #
     # Create barcodes
     #
+    start = time.time()
+
     barcode_options = [translate(base) for base in args.sequence]
 
     logging.info(f"Creating barcodes")
-    start_bc_create = time.time()
-
-    barcodes = create_barcodes(args.number, barcode_options)
-
-    logging.info(f"Barcodes created, time: {time.time() - start_bc_create:.2f} s")
-
-    #barcodes = process_create(args.processes, args.number, barcode_options)
-    # barcodes = multiprocess_create(args. processes, args.number, args.sequence)
+    barcodes = create_barcodes_generator(args.number, barcode_options)
 
     #
     # Run PCR
     #
-
-    logging.info(f"Running PCR")
     start_pcr = time.time()
-
+    logging.info(f"Running PCR")
     final_barcodes = pcr_cycles(barcodes,
                                 efficiency=args.pcr_efficency,
                                 pcr_cycles=args.pcr_cycles,
                                 error_rate=args.error_rate_pcr)
 
     logging.info(f"PCR done, time: {time.time() - start_pcr:.2f} s")
-
+    logging.info(f"PCR errors generated: {counter['pcr errors']:,}")
     #
     # Sequnencing
     #
+    start_seq = time.time()
 
     logging.info(f"Sequencing")
-    start_seq = time.time()
 
     barcodes_after_seq = add_sequencing_errors(final_barcodes,
                                                seq_error_rate=args.error_rate_seq)
 
     logging.info(f"Sequencing done, time: {time.time() - start_seq:.2f} s")
-    logging.info(f"Sequencing errors generated: {counter['sequencing errors']}")
+    logging.info(f"Sequencing errors generated: {counter['sequencing errors']:,}")
 
 
     #
@@ -266,15 +253,15 @@ def main():
     #
     print('-' * WIDTH)
     print('Results')
-    print('-'*WIDTH)
-    print(f"Number of barcodes before sequencing:     {len(barcodes):7,}")
+    print('-' * WIDTH)
+    print(f"Number of barcodes before sequencing:     {counter['Barcodes start']:7,}")
     print(f"Number of barcodes after PCR:             {len(final_barcodes):7,}")
     print(f"Number of barcode molecules after PCR:    {sum(final_barcodes.values()):7,}")
     print(f"Number of barcodes after sequencing:      {len(barcodes_after_seq):7,}")
     print(f"Number of barcode reads after sequencing: {sum(barcodes_after_seq.values()):7,}")
     print('-' * WIDTH)
 
-    logging.info(f"Total run time: {time.time() - start_bc_create:.2f} s")
+    logging.info(f"Total run time: {time.time() - start:.2f} s")
 
     if args.debug:
         for p in sorted(list(collections.Counter(barcodes).items())):
@@ -285,6 +272,7 @@ def main():
         print()
         for p in sorted(list(barcodes_after_seq.items())):
             print(p)
+
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
