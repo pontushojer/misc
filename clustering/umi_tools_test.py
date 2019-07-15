@@ -42,6 +42,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-cd-hit-454 -i  -o $file'.clustered' -T $processors -c 0.9 -gap 100 -g 1 -n 3 -M 0 > $path"/cdhit.log

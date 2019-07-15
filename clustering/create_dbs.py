@@ -4,23 +4,24 @@ Based on UMI-Tools pipeline:
 https://github.com/CGATOxford/UMI-tools_pipelines/blob/master/notebooks/Simulating_umi_deduping.ipynb
 """
 
+# TODO multiprocessing not working.
+
 import argparse
-import pandas as pd
-import sys
 import random
 import collections
-import itertools
 import numpy as np
 import logging
 import time
 from tqdm import tqdm
 import math
+import itertools
 import multiprocessing
-from queue import Queue
+import dnaio
 
 logger = logging.getLogger(__name__)
 
 counter = collections.Counter()
+true_barcodes = set()
 
 WIDTH = 50
 MULTIPROCESS_CREATE_MP_LIMIT = 10000
@@ -50,16 +51,11 @@ def translate(base):
     return translate_dict[base.upper()]
 
 
-def get_list_chunks(l, n):
-    """Yield successive n-sized chunks from l."""
-    for i in range(0, len(l), n):
-        yield l[i:i + n]
+def get_chunks(iterable, size=10):
+    iterator = iter(iterable)
+    for first in iterator:
+        yield itertools.chain([first], itertools.islice(iterator, size - 1))
 
-def get_dict_chunks(data, n=1):
-    c = None
-    it = iter(data)
-    for i in range(0, n):
-        yield {k:data[k] for k in itertools.islice(it, int(math.ceil(length/n)))}
 
 def get_arguments():
     parser = argparse.ArgumentParser()
@@ -81,6 +77,9 @@ def get_arguments():
     parser.add_argument('-p', '--processes', type=int, default=1,
                         help="Multiprocessing. Number of processes to run.")
     parser.add_argument('--debug', help="Debug mode", default=False, action="store_true")
+    parser.add_argument('-o', "--output", help="Outout file with true/false information.", type=str, default=None)
+    parser.add_argument('-of', "--output-format", help="Outout file format. Default: cd-hit", type=str, default="cd-hit")
+
     return parser.parse_args()
 
 
@@ -91,6 +90,7 @@ def create_barcode(sequence_options):
         generated_barcode += base
 
     logger.debug(f"Barcode created: {generated_barcode}")
+    true_barcodes.add(generated_barcode)
     return generated_barcode
 
 
@@ -151,11 +151,11 @@ def pcr_cycles(barcodes, efficiency=1, pcr_cycles=0, error_rate=0.00001, nprocs=
         if nprocs == 1:
             post_cycle = simulate_pcr_cycle(barcodes, efficiency=efficiency, error_rate=error_rate, no_prog=False)
         else:
-            chunks = get_list_chunks(barcodes, nprocs)
+            chunks = get_chunks(barcodes, size=10000)
             tasks = [(chunk, efficiency, error_rate) for chunk in chunks]
             post_cycle = []
             with multiprocessing.Pool(nprocs) as pool:
-                result = tqdm(pool.imap_unordered(pcr_func, tasks), total=len(barcodes), desc="Amplifying", unit="bc", leave=False)
+                result = pool.imap_unordered(pcr_func, tasks) # tqdm(pool.imap_unordered(pcr_func, tasks), total=len(barcodes), desc="Amplifying", unit="bc", leave=False)
                 for r in result:
                     post_cycle.extend(r)
 
@@ -204,7 +204,7 @@ def main():
     print('Command line options:')
 
     if args.reads:
-        args.pcr_cycles = math.ceil(math.log(args.reads/args.number - 2*args.pcr_efficency, 2*args.pcr_efficency))
+        args.pcr_cycles = math.ceil(math.log(args.reads/args.number, 2*args.pcr_efficency))
         print('Note: Calculating PCR cycles based on reads!')
 
     print('-' * WIDTH)
@@ -230,10 +230,12 @@ def main():
     final_barcodes = pcr_cycles(barcodes,
                                 efficiency=args.pcr_efficency,
                                 pcr_cycles=args.pcr_cycles,
-                                error_rate=args.error_rate_pcr)
+                                error_rate=args.error_rate_pcr,
+                                nprocs=args.processes)
 
     logging.info(f"PCR done, time: {time.time() - start_pcr:.2f} s")
     logging.info(f"PCR errors generated: {counter['pcr errors']:,}")
+
     #
     # Sequnencing
     #
@@ -254,14 +256,21 @@ def main():
     print('-' * WIDTH)
     print('Results')
     print('-' * WIDTH)
-    print(f"Number of barcodes before sequencing:     {counter['Barcodes start']:7,}")
-    print(f"Number of barcodes after PCR:             {len(final_barcodes):7,}")
-    print(f"Number of barcode molecules after PCR:    {sum(final_barcodes.values()):7,}")
-    print(f"Number of barcodes after sequencing:      {len(barcodes_after_seq):7,}")
-    print(f"Number of barcode reads after sequencing: {sum(barcodes_after_seq.values()):7,}")
+    print(f"Number of barcodes before sequencing:      {counter['Barcodes start']:7,}")
+    print(f"Number of uniq barcodes before sequencing: {len(true_barcodes):7,}")
+    print(f"Number of barcodes after PCR:              {len(final_barcodes):7,}")
+    print(f"Number of barcode molecules after PCR:     {sum(final_barcodes.values()):7,}")
+    print(f"Number of barcodes after sequencing:       {len(barcodes_after_seq):7,}")
+    print(f"Number of barcode reads after sequencing:  {sum(barcodes_after_seq.values()):7,}")
     print('-' * WIDTH)
 
     logging.info(f"Total run time: {time.time() - start:.2f} s")
+
+    distribution = sorted(collections.Counter(barcodes_after_seq.values()).items())
+    print(f"{'Freq':12} {'Reads':12}")
+    for reads, freq in distribution:
+        print(f"{freq:9} {reads:9}")
+
 
     if args.debug:
         for p in sorted(list(collections.Counter(barcodes).items())):
@@ -272,6 +281,17 @@ def main():
         print()
         for p in sorted(list(barcodes_after_seq.items())):
             print(p)
+
+    if args.output:
+        if args.output_format == 'cd-hit':
+            with dnaio.open(args.output, mode='w', fileformat='fasta') as writer:
+                for nr, (barcode, count) in enumerate(iter(barcodes_after_seq.items())):
+                    is_true = 0
+                    if barcode in true_barcodes:
+                        is_true = 1
+
+                    record = dnaio.Sequence(f"{is_true}:{nr}:{count}:{barcode}", barcode)
+                    writer.write(record)
 
 
 if __name__ == "__main__":
