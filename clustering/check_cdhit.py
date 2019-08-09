@@ -60,11 +60,21 @@ def main():
 
     if args.dist_metrics:
         external_dists = []
+        mean = 0
         for seq1, seq2 in tqdm(itertools.combinations(list(df.index.values), r=2),
                                total=int((len(clusters)*(len(clusters)-1))/2), desc="Reading pairs", unit="pairs"):
             dist = dist_func(seq1, seq2)
             if dist:
                 external_dists.append(dist)
+
+            # Check every 1000,000 pairs if change within threshold and break in that case
+            if len(external_dists) % 1000_000 == 0:
+                current_mean = np.mean(external_dists)
+
+                if abs(mean-current_mean) < 0.001:
+                    break
+                else:
+                    mean = current_mean
 
         mean_external_dist = np.mean(external_dists)
         mean_internal_dist = np.mean(df.dist)
