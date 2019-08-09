@@ -54,15 +54,20 @@ def main():
 
     df = pd.DataFrame.from_records([cluster.to_dict() for cluster in clusters]).set_index('barcode')
     df = df.sort_values("count", ascending=False)
-    print(df.head(10))
 
     print(f"Mead cluster read count: {np.mean(df['count']):.2f}")
     print(f"Mead cluster size: {np.mean(df['size']):.2f}")
 
     if args.dist_metrics:
-        external_dists = [dist_func(seq1, seq2) for seq1, seq2 in itertools.combinations(df.seq, r=2)]
+        external_dists = []
+        for seq1, seq2 in tqdm(itertools.combinations(list(df.index.values), r=2),
+                               total=int((len(clusters)*(len(clusters)-1))/2), desc="Reading pairs", unit="pairs"):
+            dist = dist_func(seq1, seq2)
+            if dist:
+                external_dists.append(dist)
+
         mean_external_dist = np.mean(external_dists)
-        mean_internal_dist = np.mean(df.mean_dist)
+        mean_internal_dist = np.mean(df.dist)
         print(f'mean_external_dist = {mean_external_dist}')
         print(f'mean_internal_dist = {mean_internal_dist}')
 
