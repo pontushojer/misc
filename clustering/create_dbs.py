@@ -77,8 +77,13 @@ def get_arguments():
     parser.add_argument('-p', '--processes', type=int, default=1,
                         help="Multiprocessing. Number of processes to run.")
     parser.add_argument('--debug', help="Debug mode", default=False, action="store_true")
-    parser.add_argument('-o', "--output", help="Outout file with true/false information.", type=str, default=None)
-    parser.add_argument('-of', "--output-format", help="Outout file format. Default: cd-hit", type=str, default="cd-hit")
+    parser.add_argument('-o', "--output", type=str, default=None,
+                        help="Outout file with true/false information. \
+                            CD-HIT: fasta file with header: >true(0/1):number:count:barcode_sequnce. \
+                            Starcode: Text file with line: <sequence> <count>. Also output separate file named \
+                            '<ouput_name>.true' with only true barcodes ")
+    parser.add_argument('-of', "--output-format", help="Outout file format. Default: cd-hit, starcode", type=str,
+                        default="cd-hit")
 
     return parser.parse_args()
 
@@ -267,10 +272,11 @@ def main():
     logging.info(f"Total run time: {time.time() - start:.2f} s")
 
     distribution = sorted(collections.Counter(barcodes_after_seq.values()).items())
-    print(f"{'Freq':12} {'Reads':12}")
+    print(f"Freq\tReads\tRatio")
     for reads, freq in distribution:
-        print(f"{freq:9} {reads:9}")
-
+        print(f"{freq}\t{reads}\t{freq/distribution[0][1]:.5f}")
+        if reads >= 10:
+            break
 
     if args.debug:
         for p in sorted(list(collections.Counter(barcodes).items())):
@@ -292,6 +298,13 @@ def main():
 
                     record = dnaio.Sequence(f"{is_true}:{nr}:{count}:{barcode}", barcode)
                     writer.write(record)
+        if args.output_format == "starcode":
+            with open(args.output, 'w') as writer, open(f"{args.output}.true", 'w') as true_writer:
+                for nr, (barcode, count) in enumerate(iter(barcodes_after_seq.items())):
+                    if barcode in true_barcodes:
+                        print(barcode, file=true_writer)
+
+                    print(f"{barcode}\t{count}", file=writer)
 
 
 if __name__ == "__main__":
